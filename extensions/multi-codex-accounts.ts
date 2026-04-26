@@ -13,6 +13,18 @@ import { dirname, join } from "node:path";
 const PROVIDER_PREFIX = "openai-codex-";
 const STATE_FILE = "multi-codex-accounts.json";
 const DEFAULT_MODEL = "gpt-5.1-codex-max";
+const ACTION_CHOICES = [
+	{ action: "add", label: "Add account (OpenAI login)" },
+	{ action: "import-codex", label: "Import existing Codex CLI login" },
+	{ action: "usage", label: "Show usage / rate limits" },
+	{ action: "switch", label: "Switch active account" },
+	{ action: "list", label: "List accounts" },
+	{ action: "default", label: "Set default account" },
+	{ action: "refresh", label: "Refresh token" },
+	{ action: "rename", label: "Rename account" },
+	{ action: "remove", label: "Remove account" },
+	{ action: "help", label: "Help" },
+] as const;
 const CALLBACK_HOST = process.env.PI_OAUTH_CALLBACK_HOST || "127.0.0.1";
 const CALLBACK_PORT = 1455;
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -189,6 +201,7 @@ function reconcileAccounts(state: State, auth: AuthData): State {
 			providerId,
 			name: existing?.name ?? inferName(providerId),
 			accountId: existing?.accountId ?? accountIdFromToken(credential.access),
+			source: existing?.source,
 			createdAt: existing?.createdAt ?? now,
 			updatedAt: existing?.updatedAt ?? now,
 		};
@@ -247,16 +260,40 @@ function registerKnownProviders(pi: ExtensionAPI): void {
 	for (const account of getAccounts()) registerAccountProvider(pi, account);
 }
 
+function actionFromChoice(choice: string | undefined): string | undefined {
+	if (!choice) return undefined;
+	return ACTION_CHOICES.find((item) => item.label === choice)?.action ?? choice;
+}
+
 function providerLabel(account: Account, activeProvider?: string, defaultProvider?: string): string {
 	const marks = [
 		account.providerId === activeProvider ? "active" : undefined,
 		account.providerId === defaultProvider ? "default" : undefined,
-		account.source === "codex-cli" ? "codex-cli" : undefined,
+		account.source === "codex-cli" ? "Codex CLI" : undefined,
 	]
 		.filter(Boolean)
-		.join(", ");
+		.join(" • ");
 	const suffix = marks ? ` [${marks}]` : "";
-	return `${account.name} (${account.providerId})${suffix}`;
+	return `${account.name} — ${account.providerId}${suffix}`;
+}
+
+function accountChoiceLabel(account: Account, activeProvider?: string, defaultProvider?: string): string {
+	return providerLabel(account, activeProvider, defaultProvider);
+}
+
+function shortId(value: string | undefined): string {
+	if (!value) return "unknown";
+	return value.length > 20 ? `${value.slice(0, 10)}…${value.slice(-6)}` : value;
+}
+
+function codexProviderStatus(providerId: string, state = loadState()): string | undefined {
+	if (!providerId.startsWith(PROVIDER_PREFIX)) return undefined;
+	const account = state.accounts[providerId];
+	return account ? `Codex: ${account.name}` : undefined;
+}
+
+function setCodexStatus(ctx: any, providerId: string, state = loadState()): void {
+	ctx.ui.setStatus("multi-codex", codexProviderStatus(providerId, state));
 }
 
 function findAccount(query: string | undefined, accounts: Account[]): Account | undefined {
@@ -358,18 +395,18 @@ function startCallbackServer(state: string): Promise<{ server?: Server; waitForC
 		const url = new URL(req.url || "", "http://localhost");
 		if (url.pathname !== "/auth/callback") {
 			res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-			res.end("<h1>OpenAI OAuth</h1><p>Callback route not found.</p>");
+			res.end("<h1>OpenAI Codex login</h1><p>Callback route not found. Return to pi and paste the redirect URL if needed.</p>");
 			return;
 		}
 		if (url.searchParams.get("state") !== state) {
 			res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-			res.end("<h1>OpenAI OAuth</h1><p>State mismatch.</p>");
+			res.end("<h1>OpenAI Codex login</h1><p>State mismatch. Return to pi and try /codex-accounts add again.</p>");
 			settle(undefined);
 			return;
 		}
 		const code = url.searchParams.get("code") ?? undefined;
 		res.writeHead(code ? 200 : 400, { "Content-Type": "text/html; charset=utf-8" });
-		res.end(code ? "<h1>OpenAI login complete</h1><p>You can close this window.</p>" : "<h1>OpenAI OAuth</h1><p>Missing code.</p>");
+		res.end(code ? "<h1>OpenAI login complete</h1><p>You can close this window and return to pi.</p>" : "<h1>OpenAI Codex login</h1><p>Missing code. Return to pi and paste the full redirect URL.</p>");
 		settle(code);
 	});
 	return new Promise((resolve) => {
@@ -385,7 +422,11 @@ async function loginWithCallbacks(callbacks: OAuthLoginCallbacks): Promise<OAuth
 	const url = authorizationUrl(state, challenge);
 	const callback = await startCallbackServer(state);
 	callbacks.onAuth({ url, instructions: "Open browser, complete login, or paste redirect URL/code." });
-	callbacks.onProgress?.("Waiting for OpenAI OAuth callback or manual code.");
+	callbacks.onProgress?.(
+		callback.server
+			? "Waiting for OpenAI OAuth callback or pasted code."
+			: `Callback server unavailable on ${CALLBACK_HOST}:${CALLBACK_PORT}; paste the redirect URL or code.`,
+	);
 
 	const manualController = new AbortController();
 	(callbacks as OAuthLoginCallbacks & { __setManualSignal?: (signal: AbortSignal) => void }).__setManualSignal?.(
@@ -429,8 +470,16 @@ function buildLoginCallbacks(pi: ExtensionAPI, ctx: any): OAuthLoginCallbacks {
 		},
 		onAuth: (info) => {
 			if (ctx.hasUI) {
-				ctx.ui.setWidget("multi-codex-oauth", ["OpenAI Codex OAuth", info.instructions ?? "Complete login.", info.url]);
-				ctx.ui.notify("OpenAI login URL ready. Browser open attempted.", "info");
+				ctx.ui.setWidget("multi-codex-oauth", [
+					"OpenAI Codex login",
+					"1. Browser should open automatically.",
+					"2. Complete OpenAI login.",
+					"3. If callback fails, paste redirect URL or code in prompt.",
+					"",
+					info.instructions ?? "Complete login.",
+					info.url,
+				]);
+				ctx.ui.notify("OpenAI login ready. Waiting for browser callback or pasted code.", "info");
 			}
 			void openUrl(pi, info.url);
 		},
@@ -440,7 +489,7 @@ function buildLoginCallbacks(pi: ExtensionAPI, ctx: any): OAuthLoginCallbacks {
 		},
 		onManualCodeInput: async () => {
 			if (!ctx.hasUI) return "";
-			return (await ctx.ui.input("Paste authorization code or redirect URL:", REDIRECT_URI, {
+			return (await ctx.ui.input("Paste OpenAI redirect URL or authorization code:", REDIRECT_URI, {
 				signal: manualSignal,
 			})) ?? "";
 		},
@@ -480,19 +529,55 @@ async function importCodexCliAccount(
 	return account;
 }
 
-async function chooseAccount(ctx: any, title: string, accounts: Account[]): Promise<Account | undefined> {
+async function chooseAccount(
+	ctx: any,
+	title: string,
+	accounts: Account[],
+	activeProvider?: string,
+	defaultProvider?: string,
+): Promise<Account | undefined> {
 	if (!ctx.hasUI) return undefined;
-	const choice = await ctx.ui.select(title, accounts.map((account) => providerLabel(account)));
+	const labels = accounts.map((account) => accountChoiceLabel(account, activeProvider, defaultProvider));
+	const choice = await ctx.ui.select(title, labels);
 	if (!choice) return undefined;
-	return accounts.find((account) => providerLabel(account) === choice);
+	return accounts.find((account) => accountChoiceLabel(account, activeProvider, defaultProvider) === choice);
 }
 
 function accountSummary(accounts: Account[], activeProvider?: string, defaultProvider?: string): string[] {
-	if (accounts.length === 0) return ["No multi Codex accounts. Run /codex-accounts add <name>."];
-	return accounts.map((account) => {
-		const id = account.accountId ? ` acct=${account.accountId}` : "";
-		return `- ${providerLabel(account, activeProvider, defaultProvider)}${id}`;
-	});
+	if (accounts.length === 0) {
+		return [
+			"Codex accounts",
+			"No accounts yet.",
+			"Start: /codex-accounts add <name>",
+			"Or import existing Codex CLI login: /codex-accounts import-codex",
+		];
+	}
+	return [
+		"Codex accounts",
+		...accounts.map((account) => {
+			const source = account.source === "codex-cli" ? "source=Codex CLI" : "source=pi login";
+			const id = `account=${shortId(account.accountId)}`;
+			return `- ${providerLabel(account, activeProvider, defaultProvider)} | ${source} | ${id}`;
+		}),
+		"",
+		"Use: /codex-accounts switch <name> | usage <name> | default <name>",
+	];
+}
+
+function helpLines(): string[] {
+	return [
+		"Codex account manager",
+		"/codex-accounts add <name>              Add OpenAI Codex login",
+		"/codex-accounts import-codex [name]     Import ~/.codex/auth.json",
+		"/codex-accounts list                    Show accounts",
+		"/codex-accounts switch <name>           Switch active account",
+		"/codex-accounts default <name>          Mark preferred account",
+		"/codex-accounts usage [name]            Show cached/live rate limits",
+		"/codex-accounts refresh <name>          Refresh OAuth token",
+		"/codex-accounts rename <name>           Rename label",
+		"/codex-accounts remove <name>           Delete stored token",
+		"Tip: account name or provider id both work.",
+	];
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -599,18 +684,47 @@ function formatDuration(ms: number): string {
 	return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function formatWindow(label: string, win?: UsageWindow): string {
-	if (!win) return `${label}: no data`;
-	const left = Math.max(0, 100 - win.usedPercent);
-	const reset = new Date(win.resetsAt * 1000);
-	return `${label}: ${win.usedPercent.toFixed(1)}% used / ${left.toFixed(1)}% left, resets ${formatDuration(reset.getTime() - Date.now())} (${reset.toLocaleString()})`;
+function formatAge(ms: number): string {
+	if (ms < 60_000) return "just now";
+	return `${formatDuration(ms)} ago`;
 }
 
-function usageLines(snapshot: UsageSnapshot | undefined): string[] {
-	if (!snapshot) return ["No usage data yet. Send one Codex request, or import Codex CLI and run usage again."];
+function percent(value: number | undefined): string {
+	return value === undefined ? "?" : `${value.toFixed(value >= 10 ? 0 : 1)}%`;
+}
+
+function usageBar(usedPercent: number, width = 18): string {
+	const used = Math.max(0, Math.min(100, usedPercent));
+	const filled = Math.round((used / 100) * width);
+	return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
+}
+
+function formatWindow(label: string, win?: UsageWindow): string {
+	if (!win) return `${label}: no usage data`;
+	const left = Math.max(0, 100 - win.usedPercent);
+	const reset = new Date(win.resetsAt * 1000);
+	return `${label}: ${usageBar(win.usedPercent)} ${percent(win.usedPercent)} used • ${left.toFixed(1)}% left • resets in ${formatDuration(reset.getTime() - Date.now())}`;
+}
+
+function usageStatus(snapshot: UsageSnapshot): string {
+	return `5h ${percent(snapshot.primary?.usedPercent)} • wk ${percent(snapshot.secondary?.usedPercent)}`;
+}
+
+function usageLines(snapshot: UsageSnapshot | undefined, account?: Account): string[] {
+	if (!snapshot) {
+		return [
+			"Codex usage",
+			account ? `Account: ${account.name} — ${account.providerId}` : "No account selected.",
+			"No usage data yet.",
+			"Send one Codex request, then run /codex-accounts usage again.",
+			"Imported Codex CLI accounts can fetch live limits via codex app-server.",
+		];
+	}
+	const collected = new Date(snapshot.collectedAt);
 	return [
-		`Provider: ${snapshot.providerId}`,
-		`Plan: ${snapshot.planType ?? "unknown"} | source: ${snapshot.source} | collected: ${new Date(snapshot.collectedAt).toLocaleString()}`,
+		"Codex usage",
+		account ? `Account: ${account.name} — ${snapshot.providerId}` : `Provider: ${snapshot.providerId}`,
+		`Plan: ${snapshot.planType ?? "unknown"} • source: ${snapshot.source} • updated ${formatAge(Date.now() - snapshot.collectedAt)} (${collected.toLocaleString()})`,
 		formatWindow("5h", snapshot.primary),
 		formatWindow("Weekly", snapshot.secondary),
 	];
@@ -628,11 +742,11 @@ export default function (pi: ExtensionAPI) {
 		const state = reconcileAccounts(loadState(), ctx.modelRegistry.authStorage.getAll() as AuthData);
 		await saveState(state);
 		for (const account of Object.values(state.accounts)) registerAccountProvider(pi, account);
-		ctx.ui.setStatus("multi-codex", ctx.model.provider.startsWith(PROVIDER_PREFIX) ? ctx.model.provider : undefined);
+		setCodexStatus(ctx, ctx.model.provider, state);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
-		ctx.ui.setStatus("multi-codex", event.model.provider.startsWith(PROVIDER_PREFIX) ? event.model.provider : undefined);
+		setCodexStatus(ctx, event.model.provider);
 	});
 
 	pi.on("after_provider_response", async (event, ctx) => {
@@ -643,13 +757,13 @@ export default function (pi: ExtensionAPI) {
 		state.usage ??= {};
 		state.usage[ctx.model.provider] = snapshot;
 		await saveState(state);
-		ctx.ui.setStatus("codex-usage", `5h ${snapshot.primary?.usedPercent ?? "?"}% wk ${snapshot.secondary?.usedPercent ?? "?"}%`);
+		ctx.ui.setStatus("codex-usage", usageStatus(snapshot));
 	});
 
 	pi.registerCommand("codex-accounts", {
 		description: "Manage multiple OpenAI Codex OAuth accounts",
 		getArgumentCompletions(prefix: string) {
-			const commands = ["add", "import-codex", "usage", "list", "switch", "default", "refresh", "remove", "rename"];
+			const commands = ["add", "import-codex", "import", "usage", "status", "list", "ls", "switch", "use", "default", "refresh", "remove", "rm", "rename", "help"];
 			return commands
 				.filter((command) => command.startsWith(prefix.trim()))
 				.map((command) => ({ value: command, label: command }));
@@ -657,27 +771,23 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			let [action, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			if (!action && ctx.hasUI) {
-				action = await ctx.ui.select("Codex account manager", [
-					"add",
-					"import-codex",
-					"usage",
-					"switch",
-					"list",
-					"default",
-					"refresh",
-					"rename",
-					"remove",
-				]);
+				action = actionFromChoice(await ctx.ui.select("Codex account manager", ACTION_CHOICES.map((item) => item.label)));
 				if (!action) return;
 			}
 			action ??= "list";
+			action = action.toLowerCase();
 
 			const state = reconcileAccounts(loadState(), ctx.modelRegistry.authStorage.getAll() as AuthData);
 			let accounts = Object.values(state.accounts).sort((a, b) => a.name.localeCompare(b.name));
 
+			if (action === "help" || action === "?") {
+				ctx.ui.setWidget("multi-codex-help", helpLines());
+				return;
+			}
+
 			if (action === "list" || action === "ls") {
 				ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, ctx.model.provider, state.defaultProviderId));
-				ctx.ui.notify(`${accounts.length} Codex account(s).`, "info");
+				ctx.ui.notify(accounts.length === 0 ? "No Codex accounts yet." : `${accounts.length} Codex account(s).`, "info");
 				return;
 			}
 
@@ -686,16 +796,29 @@ export default function (pi: ExtensionAPI) {
 					findAccount(rest.join(" "), accounts) ??
 					accounts.find((account) => account.providerId === ctx.model.provider) ??
 					(state.defaultProviderId ? state.accounts[state.defaultProviderId] : undefined) ??
-					(await chooseAccount(ctx, "Show Codex usage", accounts));
-				if (!account) return;
+					(await chooseAccount(ctx, "Show Codex usage", accounts, ctx.model.provider, state.defaultProviderId));
+				if (!account) {
+					ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, ctx.model.provider, state.defaultProviderId));
+					ctx.ui.notify("No Codex account available for usage.", "warning");
+					return;
+				}
 				const cached = state.usage?.[account.providerId];
-				const snapshot = await refreshUsageForAccount(account, cached);
+				let snapshot = cached;
+				try {
+					if (account.source === "codex-cli") ctx.ui.notify("Fetching live Codex CLI usage…", "info");
+					snapshot = await refreshUsageForAccount(account, cached);
+				} catch (error) {
+					if (!cached) throw error;
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Live usage unavailable; showing cached data. ${message}`, "warning");
+				}
 				if (snapshot) {
 					state.usage ??= {};
 					state.usage[account.providerId] = snapshot;
 					await saveState(state);
+					ctx.ui.setStatus("codex-usage", usageStatus(snapshot));
 				}
-				ctx.ui.setWidget("multi-codex-usage", usageLines(snapshot));
+				ctx.ui.setWidget("multi-codex-usage", usageLines(snapshot, account));
 				ctx.ui.notify(`Usage for ${account.name}.`, "info");
 				return;
 			}
@@ -705,7 +828,10 @@ export default function (pi: ExtensionAPI) {
 				const account = await importCodexCliAccount(pi, state, ctx.modelRegistry.authStorage, name);
 				const model = ctx.modelRegistry.find(account.providerId, ctx.model.id) ?? ctx.modelRegistry.find(account.providerId, DEFAULT_MODEL);
 				if (model) await pi.setModel(model);
-				ctx.ui.notify(`Imported Codex CLI account as ${account.providerId}.`, "info");
+				accounts = Object.values(state.accounts).sort((a, b) => a.name.localeCompare(b.name));
+				setCodexStatus(ctx, account.providerId, state);
+				ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, account.providerId, state.defaultProviderId));
+				ctx.ui.notify(`Imported Codex CLI account: ${account.name}.`, "success");
 				return;
 			}
 
@@ -714,7 +840,7 @@ export default function (pi: ExtensionAPI) {
 				let name = rest.join(" ").trim();
 				if (!name) {
 					if (!ctx.hasUI) throw new Error("Usage: /codex-accounts add <name>");
-					name = (await ctx.ui.input("Account name:", "work"))?.trim() ?? "";
+					name = (await ctx.ui.input("Account name (example: work, personal, pro):", "work"))?.trim() ?? "";
 				}
 				if (!name) return;
 
@@ -735,8 +861,11 @@ export default function (pi: ExtensionAPI) {
 
 					const model = ctx.modelRegistry.find(providerId, ctx.model.id) ?? ctx.modelRegistry.find(providerId, DEFAULT_MODEL);
 					if (model) await pi.setModel(model);
+					accounts = Object.values(state.accounts).sort((a, b) => a.name.localeCompare(b.name));
+					setCodexStatus(ctx, providerId, state);
 					ctx.ui.setWidget("multi-codex-oauth", undefined);
-					ctx.ui.notify(`Added ${name} (${providerId}).`, "info");
+					ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, providerId, state.defaultProviderId));
+					ctx.ui.notify(`Added ${name}. Active provider: ${providerId}.`, "success");
 				} catch (error) {
 					pi.unregisterProvider(providerId);
 					throw error;
@@ -745,32 +874,35 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (accounts.length === 0) {
-				ctx.ui.notify("No multi Codex accounts. Run /codex-accounts add <name>.", "warning");
+				ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, ctx.model.provider, state.defaultProviderId));
+				ctx.ui.notify("No Codex accounts yet. Add or import one first.", "warning");
 				return;
 			}
 
 			if (action === "switch" || action === "use") {
-				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Switch Codex account", accounts));
+				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Switch Codex account", accounts, ctx.model.provider, state.defaultProviderId));
 				if (!account) return;
 				const model = ctx.modelRegistry.find(account.providerId, ctx.model.id) ?? ctx.modelRegistry.find(account.providerId, DEFAULT_MODEL);
 				if (!model) throw new Error(`No Codex model found for ${account.providerId}`);
 				const ok = await pi.setModel(model);
 				if (!ok) throw new Error(`No auth for ${account.providerId}. Run /codex-accounts refresh ${account.name}.`);
-				ctx.ui.notify(`Switched to ${account.name}.`, "info");
+				setCodexStatus(ctx, account.providerId, state);
+				ctx.ui.notify(`Switched to ${account.name}.`, "success");
 				return;
 			}
 
 			if (action === "default") {
-				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Default Codex account", accounts));
+				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Default Codex account", accounts, ctx.model.provider, state.defaultProviderId));
 				if (!account) return;
 				state.defaultProviderId = account.providerId;
 				await saveState(state);
-				ctx.ui.notify(`Default Codex account: ${account.name}.`, "info");
+				ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, ctx.model.provider, state.defaultProviderId));
+				ctx.ui.notify(`Default Codex account: ${account.name}.`, "success");
 				return;
 			}
 
 			if (action === "refresh") {
-				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Refresh Codex token", accounts));
+				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Refresh Codex token", accounts, ctx.model.provider, state.defaultProviderId));
 				if (!account) return;
 				const credential = ctx.modelRegistry.authStorage.get(account.providerId);
 				if (!credential || credential.type !== "oauth") throw new Error(`No OAuth credential for ${account.providerId}`);
@@ -780,12 +912,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.modelRegistry.authStorage.set(account.providerId, { type: "oauth", ...refreshed });
 				state.accounts[account.providerId] = account;
 				await saveState(state);
-				ctx.ui.notify(`Refreshed ${account.name}.`, "info");
+				ctx.ui.notify(`Refreshed token for ${account.name}.`, "success");
 				return;
 			}
 
 			if (action === "rename") {
-				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Rename Codex account", accounts));
+				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Rename Codex account", accounts, ctx.model.provider, state.defaultProviderId));
 				if (!account) return;
 				if (!ctx.hasUI) throw new Error("Usage: /codex-accounts rename <account> then enter name in UI");
 				const next = (await ctx.ui.input("New account name:", account.name))?.trim();
@@ -795,18 +927,21 @@ export default function (pi: ExtensionAPI) {
 				state.accounts[account.providerId] = account;
 				await saveState(state);
 				registerAccountProvider(pi, account);
-				ctx.ui.notify(`Renamed to ${next}.`, "info");
+				accounts = Object.values(state.accounts).sort((a, b) => a.name.localeCompare(b.name));
+				ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, ctx.model.provider, state.defaultProviderId));
+				setCodexStatus(ctx, ctx.model.provider, state);
+				ctx.ui.notify(`Renamed account to ${next}.`, "success");
 				return;
 			}
 
 			if (action === "remove" || action === "rm" || action === "delete") {
-				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Remove Codex account", accounts));
+				const account = findAccount(rest.join(" "), accounts) ?? (await chooseAccount(ctx, "Remove Codex account", accounts, ctx.model.provider, state.defaultProviderId));
 				if (!account) return;
 				const ok = !ctx.hasUI
 					? true
 					: await ctx.ui.confirm(
 							"Remove Codex account?",
-							`This deletes stored OAuth token for ${account.name} (${account.providerId}). Continue?`,
+							`This deletes the stored OAuth token for ${account.name} (${account.providerId}). You can add it again later with /codex-accounts add. Continue?`,
 						);
 				if (!ok) return;
 				ctx.modelRegistry.authStorage.remove(account.providerId);
@@ -814,12 +949,22 @@ export default function (pi: ExtensionAPI) {
 				if (state.defaultProviderId === account.providerId) state.defaultProviderId = undefined;
 				await saveState(state);
 				pi.unregisterProvider(account.providerId);
-				ctx.ui.notify(`Removed ${account.name}.`, "info");
+				accounts = Object.values(state.accounts).sort((a, b) => a.name.localeCompare(b.name));
+				const fallback = (state.defaultProviderId ? state.accounts[state.defaultProviderId] : undefined) ?? accounts[0];
+				let activeProvider = ctx.model.provider;
+				if (ctx.model.provider === account.providerId && fallback) {
+					const model = ctx.modelRegistry.find(fallback.providerId, ctx.model.id) ?? ctx.modelRegistry.find(fallback.providerId, DEFAULT_MODEL);
+					if (model && await pi.setModel(model)) activeProvider = fallback.providerId;
+				}
+				ctx.ui.setWidget("multi-codex-accounts", accountSummary(accounts, activeProvider, state.defaultProviderId));
+				setCodexStatus(ctx, activeProvider, state);
+				ctx.ui.notify(`Removed ${account.name}.`, "success");
 				return;
 			}
 
+			ctx.ui.setWidget("multi-codex-help", helpLines());
 			throw new Error(
-				"Usage: /codex-accounts [add|import-codex|usage|list|switch|default|refresh|rename|remove] [account]",
+				`Unknown /codex-accounts action "${action}". Try /codex-accounts help.`,
 			);
 		},
 	});

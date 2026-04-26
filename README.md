@@ -25,6 +25,7 @@ Run `/reload` in pi after install or update.
 /codex-accounts refresh <name-or-provider>
 /codex-accounts rename <name-or-provider>
 /codex-accounts remove <name-or-provider>
+/codex-accounts help
 ```
 
 Each account becomes its own provider, for example:
@@ -41,5 +42,6 @@ Credentials stay in `~/.pi/agent/auth.json` under those provider IDs. Account la
 - Built-in `openai-codex` remains unchanged.
 - Existing Codex CLI auth can be imported from `~/.codex/auth.json` with `/codex-accounts import-codex`.
 - Usage is shown with `/codex-accounts usage`. For imported Codex CLI accounts, it calls `codex app-server` → `account/rateLimits/read` for live 5h/weekly limits. For pi-only accounts, it shows cached `x-codex-*` response headers after the next model response.
+- `/codex-accounts` opens a small action menu in the TUI; `/codex-accounts help` shows quick command help.
 - `/login openai-codex-<name>` also works after an account provider exists.
 - `/codex-accounts add <name>` starts OpenAI OAuth and attempts to open browser.
