@@ -1,0 +1,11 @@
+{
+  "name": "codex-accounts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension for managing multiple OpenAI Codex OAuth accounts.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/multi-codex-accounts.ts"]
+  }
+}
